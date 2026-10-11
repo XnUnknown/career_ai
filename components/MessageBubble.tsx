@@ -1,22 +1,34 @@
 "use client";
 
 import { Message } from "@/lib/types";
-import { CareerGrid } from "./CareerGrid";
+import { CareerGridCard } from "./CareerGridCard";
 import { ToolCallBadge } from "./ToolCallBadge";
 
 interface MessageBubbleProps {
   message: Message;
-  onAskAI?: (question: string) => void;
+  /** Opens that map in the right-hand panel. */
+  onOpenGrid?: (gridId: string) => void;
+  /** The map currently shown in the panel, if any. */
+  activeGridId?: string | null;
 }
 
-export function MessageBubble({ message, onAskAI }: MessageBubbleProps) {
+export function MessageBubble({
+  message,
+  onOpenGrid,
+  activeGridId,
+}: MessageBubbleProps) {
   const isUser = message.role === "user";
 
-  // Grid message — render the full career visualization
+  // A career map renders as a compact card here; the graph itself opens in the
+  // right-hand panel so a chat with several maps stays readable.
   if (message.gridData) {
     return (
-      <div className="w-full max-w-4xl mx-auto px-2 py-2 animate-fadeIn">
-        <CareerGrid data={message.gridData} onAskAI={onAskAI} />
+      <div className="w-full animate-fadeIn">
+        <CareerGridCard
+          data={message.gridData}
+          active={activeGridId === message.id}
+          onOpen={() => onOpenGrid?.(message.id)}
+        />
       </div>
     );
   }
@@ -47,4 +59,3 @@ export function MessageBubble({ message, onAskAI }: MessageBubbleProps) {
     </div>
   );
 }
-

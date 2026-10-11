@@ -2,14 +2,16 @@
  * app/api/chat/route.ts — Chat endpoint.
  *
  * The ONLY place the browser talks to the AI. It:
- *   1. Rate-limits each client IP (see lib/rateLimit.ts).
- *   2. Validates + sanitizes the incoming messages.
- *   3. Streams the model's reply back as Server-Sent Events (SSE).
- *   4. Re-assembles the career grid from the model's `start_career_grid` /
- *      `add_career_path` tool calls and streams it as it grows.
+ *   1. Requires a signed-in user (login is mandatory now — see SCHEMA_DRAFT §6 D3).
+ *   2. Rate-limits each client IP (see lib/rateLimit.ts).
+ *   3. Validates + sanitizes the incoming messages.
+ *   4. Persists the user's turn, streams the reply as Server-Sent Events, then
+ *      persists the assistant's turn along with its tool calls and any career
+ *      grid it produced.
  *
  * SSE contract for the UI:
  *   Each event is a line:  `data: <json>\n\n`
+ *   { "type": "start", "sessionId" }                        → stream opened
  *   { "type": "token", "text": "..." }                      → a piece of the answer
  *   { "type": "tool", "id", "name", "arguments" }           → a tool was called
  *   { "type": "tool_result", "id", "summary", "ok" }        → it finished (matched by id)
@@ -23,11 +25,21 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { generateRecommendation } from "@/lib/ollama";
+import { generateRecommendation, OLLAMA_MODEL } from "@/lib/ollama";
 import { rateLimit } from "@/lib/rateLimit";
+import { getSessionUser } from "@/lib/auth";
+import {
+  appendMessage,
+  createChatSession,
+  persistGrid,
+  persistToolCalls,
+  titleFrom,
+  type ToolCallRecord,
+} from "@/lib/chatStore";
+import { prisma } from "@/lib/db";
 import type { CareerGridData, CareerPath, CareerRole } from "@/lib/types/career";
 
-export const runtime = "nodejs"; // Ollama needs Node, not the Edge runtime
+export const runtime = "nodejs"; // Ollama + Prisma need Node, not the Edge runtime
 
 const MAX_MESSAGES = 20; // longer window for guided question flow
 const MAX_CONTENT = 4000; // per-message char cap
@@ -79,8 +91,32 @@ function normalizeCareerPath(args: Record<string, unknown>): CareerPath {
   };
 }
 
+/**
+ * At most one track may be recommended — a partial unique index in the
+ * database enforces this, so a model that marks two would make the grid
+ * insert fail. Keep the first, clear the rest.
+ */
+function enforceSingleRecommended(paths: CareerPath[]): void {
+  let seen = false;
+  for (const path of paths) {
+    if (!path.recommended) continue;
+    if (seen) path.recommended = false;
+    else seen = true;
+  }
+}
+
 export async function POST(req: NextRequest) {
-  // 1. Rate limit by IP
+  // 1. Login is required — without a user there is nobody to attach the
+  //    conversation to.
+  const user = await getSessionUser();
+  if (!user) {
+    return NextResponse.json(
+      { error: "You need to sign in to chat.", code: "UNAUTHENTICATED" },
+      { status: 401 }
+    );
+  }
+
+  // 2. Rate limit by IP
   const ip = clientIp(req);
   const rl = rateLimit(ip);
   const rateHeaders = {
@@ -95,8 +131,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 2. Parse + validate the body
-  let body: { messages?: unknown };
+  // 3. Parse + validate the body
+  let body: { messages?: unknown; sessionId?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -118,7 +154,41 @@ export async function POST(req: NextRequest) {
     }))
     .filter((m) => m.content.length > 0);
 
-  // 3. Stream the reply as SSE
+  // 4. Resolve the conversation. A supplied id must belong to this user —
+  //    scoping by userId in the WHERE is the ownership check.
+  let sessionId = typeof body.sessionId === "string" ? body.sessionId : null;
+
+  if (sessionId) {
+    const owned = await prisma.chatSession.findFirst({
+      where: { id: sessionId, userId: user.id },
+      select: { id: true },
+    });
+    if (!owned) sessionId = null; // stale or someone else's id → start fresh
+  }
+
+  const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
+
+  if (!sessionId) {
+    const created = await createChatSession(user.id, {
+      model: OLLAMA_MODEL,
+      title: lastUserMessage ? titleFrom(lastUserMessage.content) : "New chat",
+    });
+    sessionId = created.id;
+  }
+
+  // Persist the user's turn BEFORE calling the model, so their message isn't
+  // lost if the provider errors or the stream dies mid-flight.
+  if (lastUserMessage) {
+    await appendMessage({
+      sessionId,
+      role: "user",
+      content: lastUserMessage.content,
+    });
+  }
+
+  const turnStartedAt = Date.now();
+
+  // 5. Stream the reply as SSE
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
@@ -130,47 +200,80 @@ export async function POST(req: NextRequest) {
       const gridId = crypto.randomUUID();
       let grid: CareerGridData | null = null;
 
+      // `grid` is only ever assigned inside the tool callbacks below, which
+      // TypeScript's control-flow analysis can't see — it narrows `grid` to
+      // `null` and treats every read as unreachable. Reading through these two
+      // typed accessors keeps the declared union type at the call sites.
+      const currentGrid = (): CareerGridData | null => grid;
+      const setGrid = (next: CareerGridData | null): void => {
+        grid = next;
+      };
+
+      // Tool calls made this turn, collected for persistence.
+      const toolCalls: ToolCallRecord[] = [];
+      const byId = new Map<string, ToolCallRecord>();
+
       /** Emit the grid as it currently stands (same id → UI replaces in place). */
       const emitGrid = (final: boolean) => {
-        if (!grid || grid.paths.length === 0) return;
-        send({ type: "grid", gridId, data: grid, final });
+        const built = currentGrid();
+        if (!built || built.paths.length === 0) return;
+        send({ type: "grid", gridId, data: built, final });
+      };
+
+      /** Open the grid if the model hasn't called start_career_grid yet. */
+      const ensureGrid = (): CareerGridData => {
+        const existing = currentGrid();
+        if (existing) return existing;
+        const created: CareerGridData = {
+          title: "Career Paths for You",
+          startingPoint: { label: "You", description: "Your starting point" },
+          paths: [],
+        };
+        setGrid(created);
+        return created;
       };
 
       try {
-        send({ type: "start" });
-        await generateRecommendation(messages, {
+        // The client needs the session id immediately: a brand-new chat only
+        // learns its id from here.
+        send({ type: "start", sessionId });
+
+        const result = await generateRecommendation(messages, {
           onToken: (text) => send({ type: "token", text }),
 
           onTool: (info) => {
+            const record: ToolCallRecord = {
+              callId: info.id,
+              name: info.name,
+              arguments: info.arguments,
+              ok: true,
+            };
+            toolCalls.push(record);
+            byId.set(info.id, record);
+
             if (info.name === "start_career_grid") {
               // Opens the grid. The UI shows an empty frame until tracks arrive.
               const args = info.arguments as Record<string, unknown>;
-              grid = {
-                title: str(args.title, "Career Paths for You"),
-                startingPoint: {
-                  label: str(args.startingLabel, "You"),
-                  description: str(args.startingDescription, "Your starting point"),
-                },
-                // Models often emit add_career_path in the SAME batch as the
-                // header, so those tracks can already be here — keep them.
-                paths: grid?.paths ?? [],
+              const next = ensureGrid();
+              next.title = str(args.title, "Career Paths for You");
+              next.startingPoint = {
+                label: str(args.startingLabel, "You"),
+                description: str(args.startingDescription, "Your starting point"),
               };
+              // Models often emit add_career_path in the SAME batch as the
+              // header, so those tracks may already be here — keep them.
+              setGrid(next);
+
               send({ type: "tool", id: info.id, name: info.name, arguments: info.arguments });
               emitGrid(false);
               return;
             }
 
             if (info.name === "add_career_path") {
-              if (!grid) {
-                // Model skipped start_career_grid — open the grid on the fly.
-                grid = {
-                  title: "Career Paths for You",
-                  startingPoint: { label: "You", description: "Your starting point" },
-                  paths: [],
-                };
-              }
-              if (grid.paths.length < MAX_GRID_PATHS) {
-                grid.paths.push(normalizeCareerPath(info.arguments));
+              const next = ensureGrid();
+              if (next.paths.length < MAX_GRID_PATHS) {
+                next.paths.push(normalizeCareerPath(info.arguments));
+                setGrid(next);
                 emitGrid(false);
               } else {
                 console.warn("[chat] add_career_path beyond MAX_GRID_PATHS — ignored");
@@ -183,6 +286,14 @@ export async function POST(req: NextRequest) {
           },
 
           onToolResult: (info) => {
+            // Fold the outcome into the record so it survives a page reload.
+            const record = byId.get(info.id);
+            if (record) {
+              record.ok = info.ok;
+              record.resultSummary = info.summary;
+              record.durationMs = info.durationMs;
+            }
+
             // Lets the badge flip from "Searching…" to what actually came back.
             send({
               type: "tool_result",
@@ -195,13 +306,59 @@ export async function POST(req: NextRequest) {
           },
         });
 
-        // Final grid — marks the map complete (no more tracks coming).
-        emitGrid(true);
+        const built = currentGrid();
+        if (built && built.paths.length > 0) {
+          enforceSingleRecommended(built.paths);
+          emitGrid(true);
+        }
+
+        // 6. Persist the assistant's turn. A failure here must not break the
+        //    stream the user already received, so it's caught separately.
+        try {
+          const assistantMessage = await appendMessage({
+            sessionId,
+            role: "assistant",
+            content: result.text,
+            promptTokens: result.usage.promptTokens,
+            completionTokens: result.usage.completionTokens,
+            durationMs: Date.now() - turnStartedAt,
+          });
+
+          await persistToolCalls(assistantMessage.id, toolCalls);
+
+          const gridToSave = currentGrid();
+          if (gridToSave && gridToSave.paths.length > 0) {
+            await persistGrid({
+              gridId,
+              sessionId,
+              messageId: assistantMessage.id,
+              userId: user.id,
+              grid: gridToSave,
+            });
+          }
+        } catch (err) {
+          console.error("[chat] failed to persist the turn:", err);
+        }
+
         send({ type: "done" });
       } catch (err) {
         // Give the UI a friendly error instead of dropping the connection.
         const message = err instanceof Error ? err.message : String(err);
         console.error("[chat] error:", message);
+
+        // Record the failure so the transcript shows what went wrong.
+        try {
+          await appendMessage({
+            sessionId: sessionId as string,
+            role: "assistant",
+            content: "",
+            durationMs: Date.now() - turnStartedAt,
+            error: message.slice(0, 500),
+          });
+        } catch (persistErr) {
+          console.error("[chat] failed to record the error turn:", persistErr);
+        }
+
         const friendly = /ECONNREFUSED|fetch failed|ENOTFOUND/i.test(message)
           ? "Can't reach the local Ollama server. Start it with `ollama serve` and make sure a model is pulled (e.g. `ollama pull llama3.1`)."
           : /401|unauthorized|api key/i.test(message)

@@ -69,6 +69,24 @@ export interface ToolResultInfo extends ToolCallInfo {
   durationMs: number;
 }
 
+/** Token accounting for a whole turn, reported by the model. */
+export interface TurnUsage {
+  /**
+   * Size of the context on the final round — not a sum. Every round re-sends
+   * the whole conversation, so adding them up would count the history once per
+   * round and wildly overstate it.
+   */
+  promptTokens: number | null;
+  /** Tokens actually generated, summed across every round of the turn. */
+  completionTokens: number | null;
+}
+
+export interface GenerateResult {
+  /** The final assistant text (also streamed live through onToken). */
+  text: string;
+  usage: TurnUsage;
+}
+
 export interface GenerateOptions {
   /** Called with each chunk of the model's reply as it is produced (live tokens). */
   onToken?: (text: string) => void;
@@ -91,14 +109,46 @@ function callSignature(call: ToolCall): string {
 }
 
 /**
+ * Accumulates token counts across the rounds of one turn. Ollama reports
+ * `prompt_eval_count` / `eval_count` on the final chunk of each stream.
+ */
+class UsageMeter {
+  private completion = 0;
+  private lastPrompt: number | null = null;
+  private finished = false;
+
+  /** Feed every chunk; only the terminating one carries the counts. */
+  record(chunk: { prompt_eval_count?: number; eval_count?: number }): void {
+    if (typeof chunk.prompt_eval_count === "number") {
+      this.lastPrompt = chunk.prompt_eval_count;
+    }
+    if (typeof chunk.eval_count === "number") {
+      this.completion += chunk.eval_count;
+    }
+  }
+
+  finish(): void {
+    this.finished = true;
+  }
+
+  snapshot(): TurnUsage {
+    return {
+      promptTokens: this.lastPrompt,
+      completionTokens: this.finished || this.completion > 0 ? this.completion : null,
+    };
+  }
+}
+
+/**
  * Run the full chat loop against Ollama.
  *
- * @returns the final assistant text (also streamed live through onToken).
+ * @returns the final assistant text (also streamed live through onToken) plus
+ *          the turn's token usage, for the `messages` table.
  */
 export async function generateRecommendation(
   messages: { role: string; content: string }[],
   { onToken, onTool, onToolResult }: GenerateOptions = {}
-): Promise<string> {
+): Promise<GenerateResult> {
   const working: Message[] = [
     { role: "system", content: buildSystemPrompt() },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
@@ -106,6 +156,7 @@ export async function generateRecommendation(
 
   /** signature → times requested, so repeats are answered from context. */
   const seen = new Map<string, number>();
+  const usage = new UsageMeter();
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     // stream: true → chunks arrive as tokens; tool_calls arrive on the last chunk
@@ -128,16 +179,20 @@ export async function generateRecommendation(
       if (chunk.message?.tool_calls?.length) {
         toolCalls = chunk.message.tool_calls;
       }
+      usage.record(chunk);
     }
 
     if (toolCalls.length === 0) {
       // Final answer — already streamed token by token.
-      if (content.trim()) return content;
+      if (content.trim()) {
+        usage.finish();
+        return { text: content, usage: usage.snapshot() };
+      }
       // The model returned nothing at all; say so rather than leaving the
       // user with an empty bubble.
-      const fallback = EMPTY_REPLY_FALLBACK;
-      onToken?.(fallback);
-      return fallback;
+      onToken?.(EMPTY_REPLY_FALLBACK);
+      usage.finish();
+      return { text: EMPTY_REPLY_FALLBACK, usage: usage.snapshot() };
     }
 
     // The model asked for tools. Its request message MUST be recorded with the
@@ -242,7 +297,9 @@ export async function generateRecommendation(
     }
   }
 
-  return streamFinalAnswer(working, onToken);
+  const text = await streamFinalAnswer(working, onToken, usage);
+  usage.finish();
+  return { text, usage: usage.snapshot() };
 }
 
 /**
@@ -251,7 +308,8 @@ export async function generateRecommendation(
  */
 async function streamFinalAnswer(
   working: Message[],
-  onToken?: (text: string) => void
+  onToken: ((text: string) => void) | undefined,
+  usage: UsageMeter
 ): Promise<string> {
   let content = "";
 
@@ -276,14 +334,15 @@ async function streamFinalAnswer(
         content += piece;
         onToken?.(piece);
       }
+      usage.record(chunk);
     }
   } catch (err) {
     console.error("[chat] final answer failed:", err);
   }
 
   if (!content.trim()) {
-    content = EMPTY_REPLY_FALLBACK;
-    onToken?.(content);
+    onToken?.(EMPTY_REPLY_FALLBACK);
+    return EMPTY_REPLY_FALLBACK;
   }
 
   return content;

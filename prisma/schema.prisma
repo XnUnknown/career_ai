@@ -1,0 +1,222 @@
+// CareerCompass — Prisma schema
+//
+// Mirrors SCHEMA_DRAFT.md §5. Table and column names are mapped to snake_case
+// so the database matches the reviewed DDL exactly.
+//
+// NOT EXPRESSIBLE HERE — append these to the generated migration by hand.
+// See SCHEMA_DRAFT.md §8 for why and for the SQL:
+//   1. CHECK constraints (email lowercase, constrained sets, date_of_birth
+//      sanity, seq > 0)
+//   2. The partial unique index enforcing one recommended track per grid
+//   3. The full-text index on messages.content
+//   4. The updated_at triggers
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity. Personal data lives in UserProfile.
+// ---------------------------------------------------------------------------
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique // stored lowercased (CHECK added in migration)
+  passwordHash    String?   @map("password_hash") // null = OAuth-only account
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz(6)
+  lastLoginAt     DateTime? @map("last_login_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6) // soft delete
+
+  profile      UserProfile?
+  chatSessions ChatSession[]
+  careerGrids  CareerGrid[]
+  authSessions AuthSession[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Login sessions (email + password auth).
+//
+// The cookie carries a random token; only its SHA-256 hash is stored, so a
+// leaked database dump can't be replayed as a login. Expired rows are cleaned
+// up lazily on lookup rather than by a scheduled job.
+// ---------------------------------------------------------------------------
+model AuthSession {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash") // sha256 hex of the cookie value
+  userAgent String?   @map("user_agent")
+  ipAddress String?   @map("ip_address")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6) // logout
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("auth_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Personal + career-intake data. 1:1 with User; mostly nullable because the
+// guided intake fills it in one question at a time.
+// ---------------------------------------------------------------------------
+model UserProfile {
+  userId                String    @id @map("user_id") @db.Uuid
+  displayName           String?   @map("display_name")
+  avatarUrl             String?   @map("avatar_url") // object-storage path, not a blob
+  dateOfBirth           DateTime? @map("date_of_birth") @db.Date // age is derived, never stored
+  currentStatus         String?   @map("current_status") // student | working | between | other
+  currentRoleTitle      String?   @map("current_role_title")
+  currentEmployer       String?   @map("current_employer")
+  educationLevel        String?   @map("education_level")
+  fieldOfStudy          String?   @map("field_of_study")
+  countryCode           String?   @map("country_code") @db.Char(2) // ISO 3166-1
+  region                String?
+  city                  String?
+  postalCode            String?   @map("postal_code")
+  timezone              String? // IANA, e.g. Asia/Kolkata
+  currency              String?   @db.Char(3) // ISO 4217 — how salaries are shown
+  interests             String[]  @default([]) // intake Q2
+  hobbies               String[]  @default([]) // intake Q3
+  workStyle             String[]  @default([]) @map("work_style") // intake Q4
+  constraints           String[]  @default([]) // intake Q5
+  onboardingCompletedAt DateTime? @map("onboarding_completed_at") @db.Timestamptz(6)
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// One conversation with CareerCompass.
+// ---------------------------------------------------------------------------
+model ChatSession {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid // login required: never null
+  title         String? // auto-set from the first user message
+  model         String? // e.g. gemma4:31b — which model answered
+  status        String    @default("active") // active | archived
+  messageCount  Int       @default(0) @map("message_count") // denormalized for the sidebar
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  lastMessageAt DateTime? @map("last_message_at") @db.Timestamptz(6)
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages    Message[]
+  careerGrids CareerGrid[]
+
+  // "Recent chats" sidebar.
+  @@index([userId, lastMessageAt(sort: Desc)])
+  @@map("chat_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// One turn in a session.
+// ---------------------------------------------------------------------------
+model Message {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId        String   @map("session_id") @db.Uuid
+  seq              Int // 1,2,3… per session; the ordering key (CHECK seq > 0 in migration)
+  role             String // user | assistant | system | tool
+  content          String   @default("") // an assistant turn may be tools-only
+  promptTokens     Int?     @map("prompt_tokens") // Ollama prompt_eval_count
+  completionTokens Int?     @map("completion_tokens") // Ollama eval_count
+  durationMs       Int?     @map("duration_ms")
+  error            String? // set if the turn failed mid-stream
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  session    ChatSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  toolCalls  MessageToolCall[]
+  careerGrid CareerGrid? // a turn either draws a grid or doesn't
+
+  @@unique([sessionId, seq])
+  @@map("messages")
+}
+
+// ---------------------------------------------------------------------------
+// A tool the model invoked while producing a message. Mirrors ToolCallInfo.
+// ---------------------------------------------------------------------------
+model MessageToolCall {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  messageId     String   @map("message_id") @db.Uuid
+  callId        String   @map("call_id") // signature from lib/ollama.ts (name + args)
+  name          String // web_search | web_fetch | start_career_grid | add_career_path
+  arguments     Json     @default("{}") // shape varies per tool
+  resultSummary String?  @map("result_summary") // "Read 3 pages · 3 sources summarized"
+  ok            Boolean  @default(true)
+  durationMs    Int?     @map("duration_ms")
+  position      Int      @default(0)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId, position])
+  @@map("message_tool_calls")
+}
+
+// ---------------------------------------------------------------------------
+// Career grid — CareerGridData, normalized.
+// ---------------------------------------------------------------------------
+model CareerGrid {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId           String   @map("session_id") @db.Uuid
+  messageId           String?  @unique @map("message_id") @db.Uuid // 1:1 with the turn that drew it
+  userId              String   @map("user_id") @db.Uuid
+  title               String
+  startingLabel       String   @map("starting_label")
+  startingDescription String   @map("starting_description")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  session ChatSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  message Message?     @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paths   CareerPath[]
+
+  // "My recommendations", newest first.
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([sessionId])
+  @@map("career_grids")
+}
+
+model CareerPath {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  gridId      String  @map("grid_id") @db.Uuid
+  name        String
+  recommended Boolean @default(false) // exactly one true per grid (partial unique index in migration)
+  position    Int     @default(0) // column order in the UI
+
+  grid  CareerGrid   @relation(fields: [gridId], references: [id], onDelete: Cascade)
+  roles CareerRole[]
+
+  @@index([gridId, position])
+  @@map("career_paths")
+}
+
+model CareerRole {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  pathId         String   @map("path_id") @db.Uuid
+  position       Int      @default(0) // 0 = entry-level
+  title          String
+  yearsFromStart String   @default("") @map("years_from_start") // text: the model writes "0-1 years"
+  salaryRange    String   @default("") @map("salary_range") // text: "₹4-8 LPA", "$50K-$75K"
+  skills         String[] @default([])
+  description    String   @default("")
+  entryPath      String   @default("") @map("entry_path")
+  outlook        String   @default("")
+
+  path CareerPath @relation(fields: [pathId], references: [id], onDelete: Cascade)
+
+  @@index([pathId, position])
+  @@map("career_roles")
+}

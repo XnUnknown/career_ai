@@ -7,11 +7,14 @@ import { MessageBubble } from "./MessageBubble";
 export function ChatWindow({
   messages,
   loading,
-  onAskAI,
+  onOpenGrid,
+  activeGridId,
 }: {
   messages: Message[];
   loading: boolean;
-  onAskAI?: (question: string) => void;
+  /** Opens a career map in the right-hand panel. */
+  onOpenGrid?: (gridId: string) => void;
+  activeGridId?: string | null;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -21,14 +24,13 @@ export function ChatWindow({
 
   return (
     <div className="flex-1 overflow-y-auto px-4 py-6 space-y-3">
-      {messages.length === 0 && (
-        <div className="text-center text-muted text-sm mt-12">
-          👋 Hi! I&apos;m CareerCompass. Tell me your age, interests, and favorite
-          subjects to get started.
-        </div>
-      )}
       {messages.map((m) => (
-        <MessageBubble key={m.id} message={m} onAskAI={onAskAI} />
+        <MessageBubble
+          key={m.id}
+          message={m}
+          onOpenGrid={onOpenGrid}
+          activeGridId={activeGridId}
+        />
       ))}
       {loading && (
         <div className="flex justify-start">
@@ -45,4 +47,3 @@ export function ChatWindow({
     </div>
   );
 }
-

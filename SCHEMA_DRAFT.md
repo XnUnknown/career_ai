@@ -1,12 +1,12 @@
 # CareerCompass — Database Schema
 
-**Status:** DRAFT for review — nothing implemented yet
-**Target:** PostgreSQL 15+
+**Status:** DESIGN AGREED — models not yet generated
+**Target:** PostgreSQL 15+ via **Prisma**
 **Scope:** (1) user ↔ CareerCompass chat sessions, (2) user profile data
 
-> This is the design step. Once you approve the tables below, we generate the
-> models/migrations for the ORM you pick. The DDL in §5 is real, runnable
-> Postgres — it's the source of truth the ORM models must match.
+> Decisions are settled (see §6). The DDL in §5 is the source of truth the
+> Prisma models in `prisma/schema.prisma` must match; §8 lists the handful of
+> constraints Prisma can't express and that need raw SQL.
 
 ---
 
@@ -124,8 +124,7 @@ nullable by design).
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | `id` | `uuid` | no | PK — also sent to the client |
-| `user_id` | `uuid` | **yes** | FK → `users.id`, cascade. Null = anonymous chat (D3) |
-| `anon_id` | `text` | yes | browser id, so anonymous chats survive and can be claimed at signup |
+| `user_id` | `uuid` | no | FK → `users.id`, cascade |
 | `title` | `text` | yes | auto-set from the first user message |
 | `model` | `text` | yes | e.g. `gemma4:31b` — which model answered |
 | `status` | `text` | no | `active` / `archived`, default `active` |
@@ -133,8 +132,6 @@ nullable by design).
 | `created_at` | `timestamptz` | no | |
 | `updated_at` | `timestamptz` | no | |
 | `last_message_at` | `timestamptz` | yes | sort key for "Recent chats" |
-
-Constraint: exactly one of `user_id` / `anon_id` may be null — but not both.
 
 ### 4.4 `messages` — one turn
 
@@ -196,7 +193,7 @@ CareerGridData        →  career_grids  (+ career_paths via FK)
 | `id` | `uuid` | no | PK — **reuse as the SSE `gridId`** already sent to the browser |
 | `session_id` | `uuid` | no | FK → `chat_sessions.id`, cascade |
 | `message_id` | `uuid` | yes | FK → `messages.id`, the turn that drew it |
-| `user_id` | `uuid` | yes | FK → `users.id`, cascade (null for anonymous) |
+| `user_id` | `uuid` | no | FK → `users.id`, cascade |
 | `title` | `text` | no | |
 | `starting_label` | `text` | no | |
 | `starting_description` | `text` | no | |
@@ -315,8 +312,7 @@ create trigger user_profiles_set_updated_at before update on user_profiles
 -- --------------------------------------------------------------------------
 create table chat_sessions (
   id              uuid primary key default gen_random_uuid(),
-  user_id         uuid references users(id) on delete cascade,
-  anon_id         text,
+  user_id         uuid not null references users(id) on delete cascade,
   title           text,
   model           text,
   status          text not null default 'active',
@@ -325,8 +321,6 @@ create table chat_sessions (
   updated_at      timestamptz not null default now(),
   last_message_at timestamptz,
 
-  constraint chat_sessions_owner_present
-    check (user_id is not null or anon_id is not null),
   constraint chat_sessions_status_valid
     check (status in ('active','archived'))
 );
@@ -377,8 +371,8 @@ create table message_tool_calls (
 create table career_grids (
   id                   uuid primary key default gen_random_uuid(),
   session_id           uuid not null references chat_sessions(id) on delete cascade,
-  message_id           uuid references messages(id) on delete set null,
-  user_id              uuid references users(id) on delete cascade,
+  message_id           uuid unique references messages(id) on delete set null,
+  user_id              uuid not null references users(id) on delete cascade,
   title                text not null,
   starting_label       text not null,
   starting_description text not null,
@@ -413,9 +407,6 @@ create table career_roles (
 create index chat_sessions_user_recent_idx
   on chat_sessions (user_id, last_message_at desc nulls last);
 
-create index chat_sessions_anon_idx
-  on chat_sessions (anon_id) where anon_id is not null;
-
 -- Replaying a conversation.
 create index messages_session_seq_idx on messages (session_id, seq);
 
@@ -441,68 +432,47 @@ create index messages_content_fts_idx
 
 ---
 
-## 6. Decisions I made — and the ones I need from you
+## 6. Decisions
 
-### Made already
+All settled. The DDL in §5 already reflects them.
 
-**D1 — `users` and `user_profiles` are separate tables.**
-Auth data and personal data have different lifecycles: profile columns are
-filled in gradually during the guided intake, and PII (DOB, address, avatar)
-is easier to export/delete/anonymise when it isn't mixed into the credential
-row. It's 1:1, so joins are trivial.
+| # | Decision | Choice |
+|---|---|---|
+| D1 | Split identity from profile? | **Yes** — `users` + `user_profiles` |
+| D2 | How to store the career grid? | **Normalized** — `career_grids`/`paths`/`roles` |
+| D3 | Auth | **Login required** — `user_id` NOT NULL, no `anon_id` |
+| D4 | Profile picture | **`avatar_url`** — path into object storage, not a blob |
+| D5 | Message ordering | **`messages.seq`** — explicit counter, unique per session |
+| D6 | Email casing | **Lowercased + CHECK** — avoids `citext` |
+| D7 | Constrained sets | **`text` + CHECK**, not Postgres `ENUM` |
+| D8 | Salary / time-to-role | **`text`** — the model writes "₹4-8 LPA", "0-1 years" |
+| D9 | Education & work history | **Current status only** — no history tables |
 
-**D4 — `avatar_url`, not an image blob.**
-Store a path/key into object storage (S3/R2/Supabase Storage). Serving images
-out of Postgres bloats backups and every `select *`. If you'd rather keep it
-self-contained for the demo, swap in `avatar_data bytea` + `avatar_mime text`
-— say the word.
+Reasoning worth keeping in mind for the ones that shaped the schema:
 
-**D5 — `messages.seq`, not just `created_at`.**
-Two messages in the same turn can share a timestamp; ordering by `created_at`
-is then non-deterministic and the transcript replays out of order. An explicit
-per-session counter with a unique constraint makes ordering exact.
+**D2 — normalized grid.** You can now answer questions the product will
+actually want: which tracks get recommended most, what salary ranges you quote,
+which skills recur. It also maps 1:1 onto `CareerGridData`, so the frontend
+renderer is unchanged. Cost: 3 tables and a join instead of one jsonb blob.
 
-**D6 — email stored lowercased + a CHECK.**
-Avoids `citext` (poor ORM support) while still preventing `Bob@x.com` and
-`bob@x.com` becoming two accounts.
+**D3 — login required.** Simplifies the model: `chat_sessions.user_id` and
+`career_grids.user_id` are NOT NULL, and the `anon_id` column plus its partial
+index are gone. Consequence to plan for: **every** chat request now needs an
+authenticated user, so the auth layer has to land in the same phase — the chat
+route can't write a session without one.
 
-**D7 — `text` + CHECK instead of Postgres `ENUM` types.**
-Adding a value to a Postgres enum needs `ALTER TYPE` and can't be done in a
-transaction with other changes; a CHECK constraint is a one-line migration.
-Trade-off: no enum type safety at the DB level — the ORM layer covers that.
-
-**D8 — Salary/time-to-role stay `text`.**
-The model returns "₹4-8 LPA" or "0-1 years". Parsing to numbers loses
-information and guesses wrong on ranges. Add numeric columns later if you want
-salary analytics.
-
-### Need your call
-
-**D2 — how to store the career grid.** I've written it normalised
-(`career_grids`/`career_paths`/`career_roles`) because it lets you query
-recommendations across users — "which tracks do we recommend most", "average
-salary we quote" — and it maps 1:1 onto the type the frontend already renders.
-The alternative is one `jsonb` column holding the whole `CareerGridData`:
-2 tables instead of 4, no joins, but no querying inside the grid.
-
-**D3 — auth.** `chat_sessions.user_id` is nullable specifically so the app can
-keep working with **no login at all** (the `anon_id` path), then claim those
-sessions when someone signs up. If you'd rather require login up front, we can
-make `user_id` NOT NULL and drop `anon_id`.
-
-**D9 — education/work history.** Right now the profile holds only the
-*current* status and role, matching what the intake asks. If you want full
-history (multiple degrees, past jobs), that's two more tables —
-`education_entries` and `work_experiences` — with start/end dates. Worth doing
-if you plan to let users build a CV; skip it if the grid is the whole product.
+**D7 — text + CHECK.** A Postgres `ENUM` needs `ALTER TYPE` to grow and can't
+be changed in the same transaction as other DDL; a CHECK is a one-line
+migration. There's no enum type-safety at the DB level — the ORM layer covers
+that.
 
 ### Deliberately NOT in this schema
 
-* **Login sessions / refresh tokens** — these depend on the auth approach
-  (NextAuth vs hand-rolled cookies vs JWT). They'd be `auth_sessions` or
-  NextAuth's own tables. Not needed until D3 is settled.
-* **Rate limiting** — currently in-memory in `lib/rateLimit.ts`, resets on
-  every restart. Moving it to Postgres/Redis is a separate task.
+* **Login sessions / refresh tokens** — now that login is required (D3) you
+  need these, but their shape depends on how you authenticate (NextAuth vs
+  hand-rolled cookies vs JWT). Separate decision, separate table.
+* **Rate limiting** — still in-memory in `lib/rateLimit.ts`, resets on every
+  restart. Moving it to Postgres/Redis is a separate task.
 * **OAuth accounts** — an `oauth_accounts` table (provider, provider_user_id)
   if you offer Google/GitHub login.
 
@@ -521,13 +491,34 @@ if you plan to let users build a CV; skip it if the grid is the whole product.
 
 ---
 
-## 8. Next step
+## 8. Prisma notes
 
-Once you confirm the decisions above, the implementation order is:
+The models live in `prisma/schema.prisma`. Four things Prisma's schema language
+**cannot** express, which need raw SQL appended to the generated migration:
 
-1. Add the ORM + `DATABASE_URL`, run the initial migration from §5.
-2. Generate models mirroring these tables.
+1. **CHECK constraints** (§5: email lowercase, enum-ish sets, `date_of_birth`
+   sanity, `seq > 0`). Prisma has no `@check`. Without them the columns are
+   plain `text` and any string is accepted.
+2. **The partial unique index** `career_paths_one_recommended_idx` — enforces
+   "exactly one recommended track per grid" at the database level.
+3. **The full-text index** on `messages.content`.
+4. **`updated_at` triggers.** Prisma's `@updatedAt` handles this from the
+   application, but it won't fire for raw SQL writes (seed scripts, psql). Keep
+   the trigger as the safety net.
+
+Also: `gen_random_uuid()` is used as the DB-side PK default rather than
+Prisma's client-side `uuid()`, so raw SQL inserts and Prisma inserts agree, and
+the SSE `gridId` can be generated either side.
+
+---
+
+## 9. Next step
+
+1. `npm i -D prisma && npm i @prisma/client`, set `DATABASE_URL`.
+2. `npx prisma migrate dev --name init` from `prisma/schema.prisma`, then
+   append the raw SQL from §8 to that migration.
 3. Wire `app/api/chat/route.ts` to persist a session + turn after each
    completed stream (uses the `seq` counter).
 4. Add `GET /api/sessions` (sidebar) and `GET /api/sessions/:id` (replay).
 5. Swap `app/chat/page.tsx` from in-memory state to those endpoints.
+6. Auth layer (D3) — required before step 3 can write anything.
