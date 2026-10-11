@@ -45,8 +45,9 @@ export default function LoginPage() {
         throw new Error(data.error ?? `Request failed (${res.status})`);
       }
 
-      // Cookie is set; go to the chat.
-      router.push("/chat");
+      // Cookie is set; land on the home page, which greets them by name and
+      // offers the way into the chat.
+      router.push("/");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");

@@ -30,14 +30,20 @@ Here's how it works:
 
 Let's start simple: **how old are you, and where are you right now — school, college, or working?**`;
 
-export function buildSystemPrompt(): string {  const today = new Date().toISOString().slice(0, 10);
+/**
+ * @param profileContext  Optional "what we already know" block built from the
+ *   user's saved profile (see formatProfileForPrompt in lib/profile.ts). When
+ *   present, the intake skips the questions it already answers.
+ */
+export function buildSystemPrompt(profileContext?: string | null): string {
+  const today = new Date().toISOString().slice(0, 10);
 
   return `You are CareerCompass, a friendly, age-aware AI career advisor.
 
 # Mission
 Help people of ANY age — school students, graduates, or working professionals —
 discover realistic career paths based on who they are and what they care about.
-
+${profileContext ? `\n${profileContext}\n` : ""}
 # CONVERSATION FLOW — FOLLOW THIS EXACTLY
 
 ## Phase 1: Guided Intake (ask ONE question at a time)

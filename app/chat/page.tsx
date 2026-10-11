@@ -6,7 +6,7 @@ import { ChatWindow } from "@/components/ChatWindow";
 import { ChatInput } from "@/components/ChatInput";
 import { GridPanel } from "@/components/GridPanel";
 import { SessionSidebar, type SessionSummary } from "@/components/SessionSidebar";
-import { Message, ToolCallInfo } from "@/lib/types";
+import { Message } from "@/lib/types";
 import { CareerGridData } from "@/lib/types/career";
 import {
   clearSessionCache,
@@ -64,6 +64,14 @@ function lastGridId(messages: Message[]): string | null {
   return null;
 }
 
+/**
+ * Tools whose activity is hidden from the user. Research is an implementation
+ * detail — surfacing each query and page count made the assistant look like a
+ * scraper and buried the conversation. Grid tools are already invisible: their
+ * output is the map card itself.
+ */
+const RESEARCH_TOOLS = new Set(["web_search", "web_fetch"]);
+
 export default function ChatPage() {
   const router = useRouter();
 
@@ -75,6 +83,11 @@ export default function ChatPage() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedGridId, setSelectedGridId] = useState<string | null>(null);
+  /** True while any web research call is in flight, for the status line. */
+  const [researching, setResearching] = useState(false);
+
+  /** Ids of in-flight research calls, so the status clears only when all end. */
+  const researchIds = useRef<Set<string>>(new Set());
 
   /**
    * The map we last auto-opened. Without this, closing the pane mid-turn would
@@ -326,34 +339,20 @@ export default function ChatPage() {
               break;
 
             case "tool":
-              // Append tool call badge to the current assistant message.
-              // `id` lets the matching tool_result event find it again.
-              patchAssistant((prev) => ({
-                toolCalls: [
-                  ...(prev.toolCalls ?? []),
-                  {
-                    id: payload.id ?? crypto.randomUUID(),
-                    name: payload.name ?? "unknown",
-                    arguments: payload.arguments ?? {},
-                    status: "running" as const,
-                  } as ToolCallInfo,
-                ],
-              }));
+              // Research is deliberately NOT surfaced. The user sees a single
+              // "Researching the web…" status in ChatWindow instead of a badge
+              // per query. The calls are still persisted server-side, so the
+              // stored transcript keeps the audit trail.
+              if (RESEARCH_TOOLS.has(payload.name ?? "")) {
+                researchIds.current.add(payload.id ?? crypto.randomUUID());
+                setResearching(true);
+              }
               break;
 
             case "tool_result":
-              patchAssistant((prev) => ({
-                toolCalls: (prev.toolCalls ?? []).map((t) =>
-                  t.id === payload.id
-                    ? {
-                        ...t,
-                        status: payload.ok === false ? ("error" as const) : ("done" as const),
-                        summary: payload.summary,
-                        durationMs: payload.durationMs,
-                      }
-                    : t
-                ),
-              }));
+              if (researchIds.current.delete(payload.id ?? "")) {
+                setResearching(researchIds.current.size > 0);
+              }
               break;
 
             case "grid":
@@ -474,6 +473,7 @@ export default function ChatPage() {
         <ChatWindow
           messages={messages}
           loading={loading}
+          researching={researching}
           onOpenGrid={openGrid}
           activeGridId={selectedGridId}
         />

@@ -37,9 +37,22 @@ import {
   type ToolCallRecord,
 } from "@/lib/chatStore";
 import { prisma } from "@/lib/db";
+import { formatProfileForPrompt } from "@/lib/profile";
 import type { CareerGridData, CareerPath, CareerRole } from "@/lib/types/career";
 
 export const runtime = "nodejs"; // Ollama + Prisma need Node, not the Edge runtime
+
+/**
+ * Vercel kills a function at this many seconds. A real research turn measures
+ * ~30-40s locally (several searches, each fetching and summarizing pages, then
+ * the grid), which is well past the 10s Hobby default, so this must be raised
+ * or the stream dies mid-answer.
+ *
+ * 60 is the documented Hobby ceiling. If a turn ever needs more than that, the
+ * fix is to shorten the work (fewer searches per turn) rather than raise this —
+ * above 60 needs a paid plan.
+ */
+export const maxDuration = 60;
 
 const MAX_MESSAGES = 20; // longer window for guided question flow
 const MAX_CONTENT = 4000; // per-message char cap
@@ -239,6 +252,7 @@ export async function POST(req: NextRequest) {
         send({ type: "start", sessionId });
 
         const result = await generateRecommendation(messages, {
+          profileContext: formatProfileForPrompt(user.profile),
           onToken: (text) => send({ type: "token", text }),
 
           onTool: (info) => {

@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 /**
  * SessionSidebar — the persistent left rail listing past conversations.
  *
@@ -135,12 +137,26 @@ export function SessionSidebar({
             <div className="text-[11px] text-muted truncate">
               {user.displayName || user.email}
             </div>
-            <button
-              onClick={onSignOut}
-              className="mt-1.5 text-[11px] text-muted hover:text-ink transition"
-            >
-              Sign out
-            </button>
+            <div className="mt-1.5 flex items-center gap-3">
+              <Link
+                href="/profile"
+                className="text-[11px] text-muted hover:text-ink transition"
+              >
+                Profile
+              </Link>
+              <Link
+                href="/"
+                className="text-[11px] text-muted hover:text-ink transition"
+              >
+                Home
+              </Link>
+              <button
+                onClick={onSignOut}
+                className="text-[11px] text-muted hover:text-ink transition"
+              >
+                Sign out
+              </button>
+            </div>
           </div>
         )}
       </aside>

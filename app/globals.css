@@ -40,22 +40,59 @@ body {
   animation: drawLine 0.8s ease-out both;
 }
 
+/* ---- Scrollbars ----
+   Styled globally rather than per-component so every scroll area in the app
+   matches the theme out of the box. The browser default is a light grey bar,
+   which reads as broken against #0b0d12.
+
+   The thumb is drawn as a floating pill: a transparent border plus
+   `background-clip: content-box` insets the painted area, leaving a thin
+   rounded thumb inside a wider hit target. Firefox is covered by the
+   `scrollbar-*` properties (thumb first, then track). */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.18);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(124, 92, 255, 0.65);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: rgba(124, 92, 255, 0.9);
+}
+
+/* Windows renders little arrow buttons at the ends; they clash with the pill. */
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
 /* ---- Career Grid ---- */
 
 .career-grid-wrapper {
-  overflow-x: auto;
-  padding-bottom: 1rem;
-}
-
-/* Smooth scroll for the grid on mobile */
-.career-grid-wrapper::-webkit-scrollbar {
-  height: 4px;
-}
-.career-grid-wrapper::-webkit-scrollbar-track {
-  background: transparent;
-}
-.career-grid-wrapper::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.1);
-  border-radius: 2px;
+  /* No `overflow-x` here on purpose. The wrapper sits inside GridPanel, which
+     already scrolls both axes — giving both of them overflow produced two
+     nested horizontal scrollbars, and the inner one only appeared at the very
+     bottom of the (tall) grid, past everything the user was trying to read.
+     The panel owns scrolling so its horizontal bar stays pinned to the pane. */
+  padding-bottom: 0.5rem;
 }
 

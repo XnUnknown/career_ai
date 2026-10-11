@@ -40,12 +40,19 @@ import { buildSystemPrompt } from "@/lib/prompts";
 export { OLLAMA_MODEL };
 
 /**
- * Safety valve: tool-call rounds before we force a final answer. Generous,
- * because a full turn legitimately spends rounds on: research searches, one
- * start_career_grid, one add_career_path per track, then the summary. The
- * duplicate guard below is what actually stops runaway loops.
+ * Safety valve: tool-call rounds before we force a final answer.
+ *
+ * A normal turn needs about 4-6: a round or two of research searches, one for
+ * start_career_grid, one or two for the add_career_path calls, then the
+ * summary. 20 leaves a lot of headroom for broad questions that trigger many
+ * searches and a 5-track grid.
+ *
+ * Raising this does NOT make turns longer in practice — the duplicate guard
+ * below ends the loop as soon as the model re-requests work it already has.
+ * What actually caps a turn in production is the hosting timeout, not this
+ * number: on Vercel the function is killed at its `maxDuration` regardless.
  */
-const MAX_TOOL_ROUNDS = 12;
+const MAX_TOOL_ROUNDS = 20;
 
 /** How many times one identical call may be re-requested before we stop running it. */
 const MAX_IDENTICAL_CALLS = 1;
@@ -94,6 +101,11 @@ export interface GenerateOptions {
   onTool?: (info: ToolCallInfo) => void;
   /** Called when a tool finishes, with a compact summary of what it returned. */
   onToolResult?: (info: ToolResultInfo) => void;
+  /**
+   * "What we already know" block from the user's saved profile, so the intake
+   * doesn't re-ask what they've already entered. See lib/profile.ts.
+   */
+  profileContext?: string | null;
 }
 
 /** Stable identity for a call, so identical requests can be spotted. */
@@ -147,10 +159,10 @@ class UsageMeter {
  */
 export async function generateRecommendation(
   messages: { role: string; content: string }[],
-  { onToken, onTool, onToolResult }: GenerateOptions = {}
+  { onToken, onTool, onToolResult, profileContext }: GenerateOptions = {}
 ): Promise<GenerateResult> {
   const working: Message[] = [
-    { role: "system", content: buildSystemPrompt() },
+    { role: "system", content: buildSystemPrompt(profileContext) },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];
 
