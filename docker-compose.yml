@@ -1,0 +1,42 @@
+# Local development database.
+#
+#   docker compose up -d        start Postgres
+#   docker compose down         stop it (data survives)
+#   docker compose logs -f db   watch it
+#
+# Credentials come from `.env` in this directory (gitignored). Copy the
+# POSTGRES_* lines out of .env.example to create it.
+#
+# This is a LOCAL database only. Vercel's serverless functions cannot reach
+# `localhost` — a deployed app needs a hosted Postgres (Neon, Vercel Postgres,
+# Supabase) with DATABASE_URL pointing at it.
+
+services:
+  db:
+    image: postgres:16
+    container_name: careercompass-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is missing - create .env from .env.example}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is missing - create .env from .env.example}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is missing - create .env from .env.example}
+    ports:
+      - "5432:5432"
+    volumes:
+      - careercompass-data:/var/lib/postgresql/data
+    healthcheck:
+      # `docker compose up --wait` blocks until this passes, so migrations
+      # never race the server's startup.
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  # `name:` pins the volume so it is NOT prefixed with the compose project
+  # name. Without it, `docker compose up` would silently create a second, empty
+  # volume and the existing data would appear to vanish.
+  careercompass-data:
+    name: careercompass-data
