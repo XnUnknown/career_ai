@@ -10,3 +10,52 @@ body {
   color: #e6e8ee;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
+
+/* ---- Animations ---- */
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes drawLine {
+  from { stroke-dashoffset: 200; }
+  to   { stroke-dashoffset: 0; }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.35s ease-out both;
+}
+
+.animate-slideInRight {
+  animation: slideInRight 0.3s ease-out both;
+}
+
+.animate-drawLine {
+  animation: drawLine 0.8s ease-out both;
+}
+
+/* ---- Career Grid ---- */
+
+.career-grid-wrapper {
+  overflow-x: auto;
+  padding-bottom: 1rem;
+}
+
+/* Smooth scroll for the grid on mobile */
+.career-grid-wrapper::-webkit-scrollbar {
+  height: 4px;
+}
+.career-grid-wrapper::-webkit-scrollbar-track {
+  background: transparent;
+}
+.career-grid-wrapper::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+}
+

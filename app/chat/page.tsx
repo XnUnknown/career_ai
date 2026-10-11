@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { ChatWindow } from "@/components/ChatWindow";
 import { ChatInput } from "@/components/ChatInput";
-import { Message } from "@/lib/types";
+import { Message, ToolCallInfo } from "@/lib/types";
+import { CareerGridData } from "@/lib/types/career";
 import Link from "next/link";
 
 /**
@@ -11,16 +12,25 @@ import Link from "next/link";
  *
  * Event format (one per line, separated by a blank line):
  *   data: {"type":"token","text":"..."}                → append to the reply
- *   data: {"type":"tool","name":"...","arguments":{}}  → a tool was called
+ *   data: {"type":"tool","id","name","arguments":{}}   → a tool was called
+ *   data: {"type":"tool_result","id","summary","ok"}   → that tool finished
+ *   data: {"type":"grid","gridId","data":{...}}        → career grid (redrawn as it grows)
  *   data: {"type":"done"}                              → stream finished
  *   data: {"type":"error","message":"..."}             → something failed
  */
 
 type SSEPayload = {
-  type: "start" | "token" | "tool" | "done" | "error";
+  type: "start" | "token" | "tool" | "tool_result" | "grid" | "done" | "error";
   text?: string;
+  id?: string;
   name?: string;
   arguments?: Record<string, unknown>;
+  summary?: string;
+  ok?: boolean;
+  durationMs?: number;
+  gridId?: string;
+  final?: boolean;
+  data?: CareerGridData;
   message?: string;
 };
 
@@ -46,9 +56,13 @@ export default function ChatPage() {
       { id: assistantId, role: "assistant", content: "", createdAt: Date.now() },
     ]);
 
-    const patchAssistant = (update: (content: string) => string) =>
+    const patchAssistant = (
+      update: (prev: Message) => Partial<Message>
+    ) =>
       setMessages((m) =>
-        m.map((msg) => (msg.id === assistantId ? { ...msg, content: update(msg.content) } : msg))
+        m.map((msg) =>
+          msg.id === assistantId ? { ...msg, ...update(msg) } : msg
+        )
       );
 
     try {
@@ -94,11 +108,69 @@ export default function ChatPage() {
 
           switch (payload.type) {
             case "token":
-              patchAssistant((content) => content + (payload.text ?? ""));
+              patchAssistant((prev) => ({
+                content: prev.content + (payload.text ?? ""),
+              }));
               break;
+
             case "tool":
-              // Member 1 can surface tool calls as a badge here.
+              // Append tool call badge to the current assistant message.
+              // `id` lets the matching tool_result event find it again.
+              patchAssistant((prev) => ({
+                toolCalls: [
+                  ...(prev.toolCalls ?? []),
+                  {
+                    id: payload.id ?? crypto.randomUUID(),
+                    name: payload.name ?? "unknown",
+                    arguments: payload.arguments ?? {},
+                    status: "running" as const,
+                  } as ToolCallInfo,
+                ],
+              }));
               break;
+
+            case "tool_result":
+              patchAssistant((prev) => ({
+                toolCalls: (prev.toolCalls ?? []).map((t) =>
+                  t.id === payload.id
+                    ? {
+                        ...t,
+                        status: payload.ok === false ? ("error" as const) : ("done" as const),
+                        summary: payload.summary,
+                        durationMs: payload.durationMs,
+                      }
+                    : t
+                ),
+              }));
+              break;
+
+            case "grid":
+              // The server sends the grid repeatedly as tracks arrive, always
+              // with the same gridId. Replace that grid's message in place so
+              // the map draws itself instead of stacking up copies.
+              if (payload.data) {
+                const gridId = payload.gridId ?? "grid";
+                setMessages((m) => {
+                  const existing = m.findIndex((msg) => msg.id === gridId);
+                  if (existing === -1) {
+                    return [
+                      ...m,
+                      {
+                        id: gridId,
+                        role: "assistant" as const,
+                        content: "",
+                        createdAt: Date.now(),
+                        gridData: payload.data,
+                      },
+                    ];
+                  }
+                  return m.map((msg, i) =>
+                    i === existing ? { ...msg, gridData: payload.data } : msg
+                  );
+                });
+              }
+              break;
+
             case "error":
               throw new Error(payload.message ?? "Unknown error");
             case "done":
@@ -111,16 +183,21 @@ export default function ChatPage() {
     } catch (e) {
       const message = e instanceof Error ? e.message : "Something went wrong.";
       // Replace whatever was streamed so far with the error text.
-      patchAssistant(() => `⚠️ ${message}`);
+      patchAssistant(() => ({ content: `⚠️ ${message}` }));
     } finally {
       setLoading(false);
     }
   };
 
+  /** Called when user clicks "Ask AI about this role" in the detail panel. */
+  const handleAskAI = (question: string) => {
+    send(question);
+  };
+
   return (
     <div className="h-screen flex flex-col">
       <header className="border-b border-white/10 px-4 py-3 flex items-center justify-between">
-        <Link href="/" className="text-sm text-muted hover:text-ink">
+        <Link href="/" className="text-sm text-muted hover:text-ink transition">
           ← Home
         </Link>
         <div className="text-sm font-medium">
@@ -128,8 +205,9 @@ export default function ChatPage() {
         </div>
         <div className="text-xs text-muted">v0.1</div>
       </header>
-      <ChatWindow messages={messages} loading={loading} />
+      <ChatWindow messages={messages} loading={loading} onAskAI={handleAskAI} />
       <ChatInput onSend={send} disabled={loading} />
     </div>
   );
 }
+

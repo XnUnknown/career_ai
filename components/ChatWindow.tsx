@@ -7,9 +7,11 @@ import { MessageBubble } from "./MessageBubble";
 export function ChatWindow({
   messages,
   loading,
+  onAskAI,
 }: {
   messages: Message[];
   loading: boolean;
+  onAskAI?: (question: string) => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -26,7 +28,7 @@ export function ChatWindow({
         </div>
       )}
       {messages.map((m) => (
-        <MessageBubble key={m.id} message={m} />
+        <MessageBubble key={m.id} message={m} onAskAI={onAskAI} />
       ))}
       {loading && (
         <div className="flex justify-start">
@@ -43,3 +45,4 @@ export function ChatWindow({
     </div>
   );
 }
+
